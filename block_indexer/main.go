@@ -5,101 +5,181 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/viney-shih/goroutines"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
 
 const (
-	UserName      string = "root"
-	Password      string = "3860"
-	Addr          string = "127.0.0.1"
-	Port          int    = 3306
-	Database      string = "letmetest"
-	MaxLifetime   int    = 10
-	MaxOpenConns  int    = 10
-	MaxIdleConns  int    = 10
-	POOL_SIZE     int    = 10
-	N             int64  = 14236000
-	TEST_ENDPOINT string = "https://mainnet.infura.io/v3/c54650de28294071b4980a9217f2a724"
+	UserName     string = "root"
+	Password     string = "3860"
+	Addr         string = "127.0.0.1"
+	Port         int    = 3306
+	Database     string = "new_schema"
+	MaxLifetime  int    = 10
+	MaxOpenConns int    = 10
+	MaxIdleConns int    = 10
+	PoolSize     int    = 16
+	NumberStart  int    = 14378628
+	DbBufferSize int    = 64
+	StableSetNum int    = 20
+	TestEndPoint string = "https://mainnet.infura.io/v3/cde840a2236a4727b3eb9d3c9032cde2"
 )
 
 type Block struct {
-	Hash        string             `gorm:"varchar(64);primaryKey" json:"hash"`
-	Difficulty  string             `json:"difficulty"`
-	Extra       []byte             `json:"extra"`
-	GasLimit    uint64             `json:"gasLimit"`
-	GasUsed     uint64             `json:"gasUsed"`
-	Nonce       uint64             `json:"nonce"`
-	Number      string             `json:"number"`
-	ParentHash  common.Hash        `json:"parentHash"`
-	ReceiptHash common.Hash        `json:"receiptHash"`
-	UncleHash   common.Hash        `json:"uncleHash"`
-	Size        common.StorageSize `json:"size"`
-	Time        uint64             `json:"time"`
-	CreatedAt   time.Time          `gorm:"type:timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP" json:"created_at,omitempty"`
-	UpdatedAt   time.Time          `gorm:"type:timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP" json:"updated_at,omitempty"`
+	ID         uint64 `gorm:"primary_key;auto_increment"`
+	Hash       common.Hash
+	ParentHash common.Hash
+	Number     int
+	Time       uint64
+	Stable     bool
 }
 type Transaction struct {
-	Hash        string          `gorm:"varchar(64);primaryKey" json:"hash"`
-	BlockHash   string          `json:"block_hash"`
-	TxFrom      common.Address  `json:"tx_from"`
-	BlockNumber string          `json:"block_number"`
-	Gas         uint64          `json:"gas"`
-	GasPrice    string          `json:"gas_price"`
-	Nonce       uint64          `json:"nonce"`
-	TxTo        *common.Address `json:"tx_to"`
-	Value       string          `json:"value"`
-	Type        uint8           `json:"type"`
-	CreatedAt   time.Time       `gorm:"type:timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP" json:"created_at,omitempty"`
-	UpdatedAt   time.Time       `gorm:"type:timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP" json:"updated_at,omitempty"`
+	ID        uint64 `gorm:"primary_key;auto_increment"`
+	BlockHash common.Hash
+	Hash      common.Hash
+	TxFrom    common.Address
+	TxTo      common.Address
+	Nounce    uint64
+	Stable    bool
+}
+type Blocks struct {
+	blocks [DbBufferSize]Block
+	index  int
+}
+type Txs struct {
+	transactions [DbBufferSize]Transaction
+	index        int
 }
 
-func index_block(conn *gorm.DB, chainID *big.Int, idx *big.Int, client *ethclient.Client) {
-	block, _ := client.BlockByNumber(context.TODO(), idx)
-	b := Block{
-		Hash:        block.Hash().String(),
-		Difficulty:  block.Difficulty().String(),
-		Extra:       block.Extra(),
-		GasLimit:    block.GasLimit(),
-		GasUsed:     block.GasUsed(),
-		Nonce:       block.Nonce(),
-		Number:      block.Number().String(),
-		ParentHash:  block.ParentHash(),
-		ReceiptHash: block.ReceiptHash(),
-		UncleHash:   block.UncleHash(),
-		Size:        block.Size(),
-		Time:        block.Time(),
+var wg = sync.WaitGroup{}
+
+func min(x, y int) int {
+	if x < y {
+		return x
 	}
-	conn.Create(&b)
-	txs := []Transaction{}
-	for _, tx := range block.Transactions() {
-		from, _ := types.Sender(types.LatestSignerForChainID(chainID), tx)
-		txs = append(txs,
-			Transaction{
-				Hash:        tx.Hash().String(),
-				BlockHash:   block.Hash().String(),
-				TxFrom:      from,
-				BlockNumber: block.Number().String(),
-				Gas:         tx.Gas(),
-				GasPrice:    tx.GasPrice().String(),
-				Nonce:       tx.Nonce(),
-				TxTo:        tx.To(),
-				Value:       tx.Value().String(),
-				Type:        tx.Type(),
-			})
+	return y
+}
+func (bs *Blocks) writeDb(conn *gorm.DB, chainID *big.Int, b *types.Block, stable bool) {
+	numberString := b.Number().String()
+	number, _ := strconv.Atoi(numberString)
+	bs.blocks[bs.index] = Block{
+		Hash:       b.Hash(),
+		Stable:     stable,
+		ParentHash: b.ParentHash(),
+		Number:     number,
+		Time:       b.Time(),
 	}
-	conn.Create(&txs)
+	bs.index++
+	if bs.index == DbBufferSize {
+		conn.Create(&bs.blocks)
+		bs.index = 0
+	}
+	txsBuffer := &Txs{}
+	for _, tx := range b.Transactions() {
+		txsBuffer.writeDb(conn, chainID, tx, b.Hash(), stable)
+	}
+	txsBuffer.flush(conn)
+}
+func (bs *Blocks) flush(conn *gorm.DB) {
+	if bs.index > 0 {
+		conn.Create(bs.blocks[:bs.index])
+		bs.index = 0
+	}
+}
+func (txs *Txs) writeDb(conn *gorm.DB, chainID *big.Int, tx *types.Transaction, blockHash common.Hash, stable bool) {
+	from, _ := types.Sender(types.LatestSignerForChainID(chainID), tx)
+	var to common.Address
+	if tx.To() != nil {
+		to = *tx.To()
+	}
+	txs.transactions[txs.index] = Transaction{
+		BlockHash: blockHash,
+		Hash:      tx.Hash(),
+		Stable:    stable,
+		TxFrom:    from,
+		TxTo:      to,
+		Nounce:    tx.Nonce(),
+	}
+	txs.index++
+	if txs.index == DbBufferSize {
+		conn.Create(&txs.transactions)
+		txs.index = 0
+	}
+}
+func (txs *Txs) flush(conn *gorm.DB) {
+	if txs.index > 0 {
+		conn.Create(txs.transactions[:txs.index])
+		txs.index = 0
+	}
+}
+func getLatestBlockNumber(client *ethclient.Client) int {
+	header, err := client.HeaderByNumber(context.Background(), nil)
+	if err != nil {
+		time.Sleep(5 * time.Second)
+		return getLatestBlockNumber(client)
+	}
+	numberString := header.Number.String()
+	latestNumber, _ := strconv.Atoi(numberString)
+	return latestNumber
+}
+func getBlockByNumber(client *ethclient.Client, index int) *types.Block {
+	block, err := client.BlockByNumber(context.TODO(), big.NewInt(int64(index)))
+	if err != nil {
+		time.Sleep(5 * time.Second)
+		return getBlockByNumber(client, index)
+	}
+	return block
+}
+func blockReader(conn *gorm.DB, chainID *big.Int, client *ethclient.Client, ch <-chan int) {
+	blockBuffer := &Blocks{}
+	for i := range ch {
+		block := getBlockByNumber(client, i)
+		blockBuffer.writeDb(conn, chainID, block, true)
+	}
+	blockBuffer.flush(conn)
+	wg.Done()
+}
+func blockTracker(conn *gorm.DB, chainID *big.Int, client *ethclient.Client, i int, ch <-chan struct{}) {
+	blockBuffer := &Blocks{}
+	block := getBlockByNumber(client, i)
+	oldHash := block.Hash()
+	blockBuffer.writeDb(conn, chainID, block, false)
+	blockBuffer.flush(conn)
+Loop:
+	for {
+		select {
+		case <-ch:
+			if oldHash != block.Hash() {
+				// delete the old data
+				conn.Where("hash = ?", oldHash).Delete(&Block{})
+				conn.Where("block_hash = ?", oldHash).Delete(&Transaction{})
+				blockBuffer.writeDb(conn, chainID, block, true)
+				blockBuffer.flush(conn)
+				fmt.Printf("detect different blocks %v: %v, %v\n", i, oldHash, block.Hash())
+			} else {
+				// update stable=true
+				conn.Model(&Block{}).Where("hash = ?", oldHash).Update("stable", true)
+				conn.Model(&Transaction{}).Where("block_hash = ?", oldHash).Update("stable", true)
+			}
+			break Loop
+		default:
+			block = getBlockByNumber(client, i)
+			time.Sleep(5 * time.Second)
+		}
+	}
+	fmt.Printf("block: %v is stable now\n", i)
 }
 func main() {
 
-	client, err := ethclient.Dial(TEST_ENDPOINT)
+	client, err := ethclient.Dial(TestEndPoint)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -121,24 +201,45 @@ func main() {
 	db.SetConnMaxLifetime(time.Duration(MaxLifetime) * time.Second)
 	db.SetMaxIdleConns(MaxIdleConns)
 	db.SetMaxOpenConns(MaxOpenConns)
-
 	conn.Debug().AutoMigrate(&Block{})
 	conn.Debug().AutoMigrate(&Transaction{})
 
-	last_number := big.NewInt(N - 1)
-	p := goroutines.NewPool(POOL_SIZE)
-	defer p.Release()
-	for {
-		header, _ := client.HeaderByNumber(context.TODO(), nil)
-		if last_number.String() != header.Number.String() {
-			for i := big.NewInt(0).Add(last_number, big.NewInt(1)); i.Cmp(header.Number) <= 0; i.Add(i, big.NewInt(1)) {
-				p.Schedule(func() {
-					index_block(conn, chainID, i, client)
-				})
-			}
-			last_number = header.Number
+	// here I only read the stable blocks
+	stableNumber := NumberStart - 1
+	latestNumber := getLatestBlockNumber(client)
+	fmt.Printf("stableNumber: %v, latestNumber: %v\n", stableNumber, latestNumber)
+	if stableNumber < latestNumber-StableSetNum {
+		realPoolSize := min(PoolSize, latestNumber-stableNumber-StableSetNum)
+		wg.Add(realPoolSize)
+		ch := make(chan int, realPoolSize)
+		for i := 0; i < realPoolSize; i++ {
+			go blockReader(conn, chainID, client, ch)
 		}
-		log.Println("fully synced")
+		for i := stableNumber + 1; i <= latestNumber-StableSetNum; i++ {
+			ch <- i
+		}
+		close(ch)
+		wg.Wait()
+		stableNumber = latestNumber - StableSetNum
+	}
+
+	// here read the latest unstable blocks and track them util it becomes a stable block
+	queue := []int{}
+	doneMap := make(map[int]chan struct{})
+	for {
+		latestNumber := getLatestBlockNumber(client)
+		fmt.Printf("stableNumber: %v, latestNumber: %v\n", stableNumber, latestNumber)
+		for i := len(queue); i < latestNumber-stableNumber; i++ {
+			ch := make(chan struct{})
+			doneMap[stableNumber+i] = ch
+			queue = append(queue, stableNumber+i)
+			go blockTracker(conn, chainID, client, stableNumber+i, ch)
+		}
+		for len(queue) > StableSetNum {
+			doneMap[queue[0]] <- struct{}{}
+			queue = queue[1:]
+			stableNumber++
+		}
 		time.Sleep(5 * time.Second)
 	}
 
