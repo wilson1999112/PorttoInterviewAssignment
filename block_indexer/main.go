@@ -157,6 +157,7 @@ Loop:
 	for {
 		select {
 		case <-ch:
+			block = getBlockByNumber(client, i)
 			if oldHash != block.Hash() {
 				// delete the old data
 				conn.Where("hash = ?", oldHash).Delete(&Block{})
@@ -171,8 +172,8 @@ Loop:
 			}
 			break Loop
 		default:
-			block = getBlockByNumber(client, i)
-			time.Sleep(5 * time.Second)
+			// fmt.Println("just a tracking here")
+			time.Sleep(1 * time.Second)
 		}
 	}
 	fmt.Printf("block: %v is stable now\n", i)
