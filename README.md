@@ -1,3 +1,5 @@
+# Is Someone using the code? cool
+# Just information, this code is bad at err handling
 # Portto Interview Assignment
 * 用 golang 實作兩個 Ethereum blockchain service
 * 設計 postgres / mysql DB schema
